@@ -189,6 +189,42 @@ def read_proc_io(pid, proc_dir="/proc"):
     return comm, d.get("syscr", 0) + d.get("syscw", 0), d.get("read_bytes", 0), d.get("write_bytes", 0)
 
 
+def parse_lsof(out):
+    """`lsof -F pftn` output -> {fd: label} (path for files; "(PIPE)", "(IPv4)"... otherwise).
+    An fd that different matching processes map to different things is ambiguous and left out."""
+    recs, cur = [], {}
+    for line in out.splitlines():
+        if not line:
+            continue
+        tag, val = line[0], line[1:]
+        if tag in "pf":
+            if "fd" in cur and "name" in cur:
+                recs.append(cur)
+            cur = {} if tag == "p" else {"fd": int(val) if val.isdigit() else None}
+        elif tag == "t":
+            cur["type"] = val
+        elif tag == "n":
+            cur["name"] = val
+    if "fd" in cur and "name" in cur:
+        recs.append(cur)
+    found = collections.defaultdict(set)
+    for r in recs:
+        if r["fd"] is not None:
+            found[r["fd"]].add(r["name"] if r["name"].startswith("/") else f"({r.get('type') or 'other'})")
+    return {fd: next(iter(v)) for fd, v in found.items() if len(v) == 1}
+
+
+def lsof_lookup(proc, fds, timeout=5):
+    """What the given fds of processes whose command starts with `proc` point to ({} on any failure)."""
+    cmd = ["lsof", "-nP", "+c", "0", "-a", "-c", proc, "-d", ",".join(str(f) for f in sorted(fds)), "-F", "pftn"]
+    try:
+        out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                             errors="replace", timeout=timeout).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    return parse_lsof(out)
+
+
 # ------------------------------------------------------------------ collector
 class Counter:
     __slots__ = ("ops", "rbytes", "wbytes", "events")
@@ -232,15 +268,23 @@ class State:
         self.note = ""         # a limitation worth showing (e.g. not root)
         self.files_note = ""   # why the Files/Events views are empty (e.g. fatrace missing)
         self.file_bytes = IS_MAC   # False when per-file byte counts are unavailable (Linux)
+        # macOS: reads/writes on fds opened before we started are resolved later with lsof
+        self.resolver_on = False
+        self.resolved = {}         # (proc, fd) -> path/label found by lsof
+        self.unk = {}              # (proc, fd) -> [ops, rbytes, wbytes] waiting for resolution
+        self.pending = set()       # (proc, fd) to look up
+        self.tried = set()         # (proc, fd) already looked up
 
-    def _add_path(self, now, path, r, w):
+    def _add_path(self, now, path, r, w, ops=1):
         if path in self.paths or len(self.paths) < MAX_PATHS:
-            self.paths[path].add(now, r, w)
+            self.paths[path].add(now, r, w, ops)
 
     def handle(self, ev, raw):
         """macOS: one parsed fs_usage line."""
         if ev["proc"] in SELF or self.paused:
             return
+        if self.resolver_on and ev["proc"] == "lsof":
+            return      # our own resolver: counting it would feed back into more lookups
         now = time.time()
         call, proc, fd = ev["call"], ev["proc"], ev["fd"]
         key = (proc, fd)
@@ -251,16 +295,66 @@ class State:
             self.fdmap[key] = path
         elif call in CLOSE_CALLS and fd is not None:
             self.fdmap.pop(key, None)
+            self.resolved.pop(key, None)
+            self.tried.discard(key)
         if not path and fd is not None:
-            path = self.fdmap.get(key)
+            path = self.fdmap.get(key) or self.resolved.get(key)
         r = ev["nbytes"] if call in READ_CALLS else 0
         w = ev["nbytes"] if call in WRITE_CALLS else 0
+        unknown = not path and fd is not None and (r or w)
         with self.lock:
             self.procs[proc].add(now, r, w)
             self.total.add(now, r, w)
             if path or r or w:
                 self._add_path(now, path or "(unknown fd)", r, w)
+            if unknown and self.resolver_on:
+                self._note_unknown(key, r, w)
             self.log.append((ev["ts"], proc, path or "", raw.rstrip("\n")))
+
+    def _note_unknown(self, key, r, w):
+        """Remember traffic on an unresolved fd and queue a lookup. Caller holds the lock."""
+        u = self.unk.get(key)
+        if u is None:
+            if key in self.tried or len(self.unk) >= 2000:
+                return
+            u = self.unk[key] = [0, 0, 0]
+            self.pending.add(key)
+        u[0] += 1
+        u[1] += r
+        u[2] += w
+
+    def take_pending(self):
+        """{proc: {fds}} still to look up; marks them as tried."""
+        with self.lock:
+            todo = collections.defaultdict(set)
+            for proc, fd in self.pending:
+                todo[proc].add(fd)
+            self.tried.update(self.pending)
+            self.pending.clear()
+            if len(self.tried) > 20000:
+                self.tried.clear()
+            return todo
+
+    def apply_resolved(self, proc, fds, mapping):
+        """Record lsof results and move the bytes already counted under "(unknown fd)" to the real file."""
+        now = time.time()
+        with self.lock:
+            if len(self.resolved) > MAX_FDS:
+                self.resolved.clear()
+            unk = self.paths.get("(unknown fd)")
+            for fd in fds:
+                key = (proc, fd)
+                u = self.unk.pop(key, None)
+                label = mapping.get(fd)
+                if not label:
+                    continue
+                self.resolved[key] = label
+                if u and unk:
+                    unk.ops, unk.rbytes, unk.wbytes = (max(0, unk.ops - u[0]), max(0, unk.rbytes - u[1]),
+                                                       max(0, unk.wbytes - u[2]))
+                    self._add_path(now, label, u[1], u[2], u[0])
+            if unk and not (unk.ops or unk.rbytes or unk.wbytes):
+                self.paths.pop("(unknown fd)", None)      # nothing left in the bucket: drop the empty row
 
     def add_io(self, proc, ops, r, w):
         """Linux: a per-process delta from /proc."""
@@ -341,6 +435,17 @@ class FatraceReader(CmdReader):
             self.state.add_file_event(ev, line)
 
 
+class FdResolver(Source):
+    """macOS: fs_usage only prints a path when a file is opened; look up older fds with lsof, about once a second."""
+
+    def run(self):
+        while not self._halt.wait(1.0):
+            for proc, fds in list(self.state.take_pending().items())[:15]:
+                if self._halt.is_set():
+                    return
+                self.state.apply_resolved(proc, fds, lsof_lookup(proc, fds))
+
+
 class ProcReader(Source):
     """Linux: poll /proc/<pid>/io and feed the per-process deltas of real disk I/O."""
 
@@ -383,7 +488,11 @@ class ProcReader(Source):
 def make_sources(state):
     """Pick the data sources for this OS and record limitations on `state`."""
     if IS_MAC:
-        return [FsUsageReader(state)]
+        srcs = [FsUsageReader(state)]
+        if shutil.which("lsof"):
+            state.resolver_on = True
+            srcs.append(FdResolver(state))
+        return srcs
     srcs = [ProcReader(state)]
     root = os.geteuid() == 0
     if not root:
