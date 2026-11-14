@@ -295,6 +295,7 @@ class State:
         self.names = {}            # truncated fs_usage name -> full name (macOS)
         self.trunc = set()         # truncated names waiting to be expanded
         self.name_tried = set()
+        self.helpers = set()       # helper commands diskmon itself runs (ignored), set by make_sources
         self.resolver_on = False
         self.resolved = {}         # (proc, fd) -> path/label found by lsof
         self.unk = {}              # (proc, fd) -> [ops, rbytes, wbytes] waiting for resolution
@@ -309,8 +310,8 @@ class State:
         """macOS: one parsed fs_usage line."""
         if ev["proc"] in SELF or self.paused:
             return
-        if self.resolver_on and ev["proc"] == "lsof":
-            return      # our own resolver: counting it would feed back into more lookups
+        if ev["proc"] in self.helpers:
+            return      # our own helper commands: counting them would feed back into more lookups
         now = time.time()
         call, raw_proc, fd = ev["call"], ev["proc"], ev["fd"]
         key = (raw_proc, fd)                         # fd bookkeeping and lsof use fs_usage's own name
@@ -551,8 +552,10 @@ def make_sources(state):
     """Pick the data sources for this OS and record limitations on `state`."""
     if IS_MAC:
         srcs = [FsUsageReader(state), NameResolver(state)]
+        state.helpers.add("ps")
         if shutil.which("lsof"):
             state.resolver_on = True
+            state.helpers.add("lsof")
             srcs.append(FdResolver(state))
         return srcs
     srcs = [ProcReader(state)]
