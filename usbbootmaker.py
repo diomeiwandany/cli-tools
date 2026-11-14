@@ -11,7 +11,9 @@ by reading the device back; Windows file copies are not read back.
     python3 usbbootmaker.py --help
 
 Standard library only. Writing to drives needs root; the script re-launches
-itself through sudo when you start a write.
+itself through sudo when you start a write. On start it checks every external
+tool it may need and offers to install the missing ones in one go (brew on
+macOS; apt-get, dnf, yum, pacman, zypper or apk on Linux).
 """
 
 import argparse
@@ -711,6 +713,8 @@ LINUX_PACKAGES: Dict[str, Dict[str, str]] = {
                    "zypper": "dosfstools", "apk": "dosfstools"},
     "mkfs.exfat": {"apt-get": "exfatprogs", "dnf": "exfatprogs", "yum": "exfatprogs", "pacman": "exfatprogs",
                    "zypper": "exfatprogs", "apk": "exfatprogs"},
+    "wimlib-imagex": {"apt-get": "wimtools", "dnf": "wimlib-utils", "yum": "wimlib-utils", "pacman": "wimlib",
+                      "zypper": "wimlib", "apk": "wimlib"},
 }
 PACKAGE_MANAGER_ORDER = ["apt-get", "dnf", "yum", "pacman", "zypper", "apk"]
 PACKAGE_INSTALL_ARGS = {
@@ -750,7 +754,7 @@ def required_linux_tools(kind_is_raw: bool, fs: str = "FAT32") -> List[str]:
 
 
 def missing_tools(tools: List[str]) -> List[str]:
-    return [t for t in tools if find_tool(t) is None]
+    return [t for t in tools if (find_wimlib() if t == "wimlib-imagex" else find_tool(t)) is None]
 
 
 def linux_packages_for(tools: List[str], manager: str) -> List[str]:
@@ -839,27 +843,102 @@ def ensure_wimlib(assume_yes: bool = False, dry_run: bool = False) -> str:
     return found
 
 
+# Every external tool this platform may need, and what it is for.
+TOOL_PURPOSE = {
+    "diskutil": "list, erase and eject drives (ships with macOS)",
+    "hdiutil": "mount ISO images (ships with macOS)",
+    "lsblk": "list drives",
+    "umount": "unmount drives and images",
+    "mount": "mount ISO images and the new volume",
+    "blockdev": "flush the device after a raw write",
+    "parted": "partition the USB drive for Windows installers",
+    "mkfs.vfat": "format FAT32",
+    "mkfs.exfat": "format exFAT",
+    "wimlib-imagex": "split an install.wim over 4 GB so it fits FAT32",
+}
+
+
+def all_tools() -> List[str]:
+    """Every external tool usbbootmaker may call on this platform, whatever the image type."""
+    if IS_MAC:
+        return ["diskutil", "hdiutil", "wimlib-imagex"]
+    return ["lsblk", "umount", "blockdev", "mount", "parted", "mkfs.vfat", "mkfs.exfat", "wimlib-imagex"]
+
+
+def install_command_for(tools: List[str]) -> Optional[List[str]]:
+    """The single command (with sudo when needed) that installs `tools` here, or None if it can't be built."""
+    if IS_MAC:
+        return wimlib_install_command() if "wimlib-imagex" in tools else None   # the rest ships with macOS
+    manager = detect_package_manager()
+    packages = linux_packages_for(tools, manager) if manager else []
+    if not packages:
+        return None
+    prefix: List[str] = [] if os.geteuid() == 0 else (["sudo"] if shutil.which("sudo") else None)
+    if prefix is None:
+        return None
+    return prefix + PACKAGE_INSTALL_ARGS[manager] + packages
+
+
+def ensure_all_tools(assume_yes: bool = False, dry_run: bool = False) -> List[str]:
+    """Check every tool this platform may need and offer to install the missing ones with ONE prompt.
+
+    Called at startup so nothing runs out half way through writing a drive. Declining (or a failed install) is
+    not fatal here: the write-time checks still stop before a drive is touched. Returns the tools still missing."""
+    missing = missing_tools(all_tools())
+    if not missing:
+        return []
+    system = [t for t in missing if t in ("diskutil", "hdiutil")]
+    installable = [t for t in missing if t not in system]
+    if system:
+        warn("These macOS system tools are missing: " + ", ".join(system) + ". Check your PATH or reinstall them.")
+    if not installable:
+        return missing
+    warn("These tools are not installed yet:")
+    for tool in installable:
+        print(f"    {tool:<14} {dim(TOOL_PURPOSE.get(tool, ''))}")
+    command = install_command_for(installable)
+    if command is None:
+        if IS_MAC:
+            warn("Homebrew was not found. Install it from https://brew.sh, then run: brew install wimlib")
+        elif detect_package_manager() is None:
+            warn("No supported package manager found. Install them yourself: " + ", ".join(installable))
+        else:
+            warn("Administrator rights (sudo) are needed to install them: " + ", ".join(installable))
+        return missing
+    print(f"  Install command: {' '.join(command)}")
+    if dry_run:
+        print(dim("  [dry-run] would install the tools above"))
+        return missing
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            warn("Not a terminal, so nothing was installed. Run the command above yourself, or use --check -y.")
+            return missing
+        if not ask_yes_no("Install them now?", True):
+            warn("Skipped. Anything that needs these tools will stop with an error until they are installed.")
+            return missing
+    info("Installing…")
+    result = subprocess.run(command)
+    still = missing_tools(installable) + system
+    if result.returncode != 0 or still:
+        warn("The install did not finish: " + ", ".join(still or installable) + f"\n  Try manually: {' '.join(command)}")
+    else:
+        ok("All required tools are installed.")
+    return still
+
+
 def check_deps(assume_yes: bool = False) -> int:
     """`--check`: report every tool this platform may need and offer to install what is missing."""
     info(f"Platform: {platform.system()} {platform.release()}")
     if not (IS_MAC or IS_LINUX):
         raise CliError("Only macOS and Linux are supported.")
-    builtin = ["diskutil", "hdiutil"] if IS_MAC else []
-    linux_tools = ["lsblk", "umount", "blockdev", "mount", "parted", "mkfs.vfat", "mkfs.exfat"] if IS_LINUX else []
-    missing_builtin = [t for t in builtin if find_tool(t) is None]
-    for tool in builtin + linux_tools + ["wimlib-imagex"]:
+    for tool in all_tools():
         found = find_wimlib() if tool == "wimlib-imagex" else find_tool(tool)
         print(f"  {tool:<14} {green('OK ') + dim(found) if found else yellow('MISSING')}")
-    if missing_builtin:
-        raise CliError("These ship with macOS and are missing: " + ", ".join(missing_builtin)
-                       + ". Check your PATH or reinstall the system tools.")
-    if IS_LINUX:
-        ensure_linux_tools(linux_tools, assume_yes)
-    try:
-        ensure_wimlib(assume_yes)      # needed only for Windows ISOs with an install.wim over 4 GB on FAT32
-    except CliError as e:
-        warn(str(e).splitlines()[0])
-    ok("All required tools are available." if not missing_tools(linux_tools) else "Some tools are still missing.")
+    still = ensure_all_tools(assume_yes)
+    if still:
+        warn("Still missing: " + ", ".join(still))
+        return 1
+    ok("All required tools are available.")
     return 0
 
 
@@ -1431,6 +1510,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         opts = Options(mode=args.mode, fs=args.fs, verify=not args.no_verify, eject=not args.no_eject,
                        label=args.label, checksum=args.checksum, dry_run=args.dry_run)
+        ensure_all_tools(args.yes, args.dry_run)      # offer to install every missing tool, once, up front
         if args.image or args.device:
             if not (args.image and args.device):
                 raise CliError("Use --image and --device together (or neither for the interactive menu).")
