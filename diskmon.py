@@ -157,7 +157,7 @@ def parse_line(line):
         "fd": int(fd.group(1)) if fd else None,
         "nbytes": 0 if disk_level else (int(b.group(1), 16) if b else 0),
         "path": path,
-        "proc": m.group("proc").strip(),
+        "proc": m.group("proc").lstrip(),   # keep a trailing space: it marks a truncated name
     }
 
 
@@ -187,6 +187,29 @@ def read_proc_io(pid, proc_dir="/proc"):
         except ValueError:
             pass
     return comm, d.get("syscr", 0) + d.get("syscw", 0), d.get("read_bytes", 0), d.get("write_bytes", 0)
+
+
+def ps_command_names():
+    """Base names of every running executable (full, untruncated process names)."""
+    try:
+        out = subprocess.run(["ps", "-axo", "comm="], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, errors="replace", timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return {os.path.basename(line.strip()) for line in out.splitlines() if line.strip()}
+
+
+def expand_names(truncated, names):
+    """{truncated fs_usage name: full name}. fs_usage cuts names at 31 characters; a name is only expanded when
+    exactly one running executable starts with it and the name is not itself a complete executable name."""
+    mapping = {}
+    for raw in truncated:
+        if raw in names:
+            continue
+        cands = {n for n in names if n.startswith(raw)}
+        if len(cands) == 1:
+            mapping[raw] = cands.pop()
+    return mapping
 
 
 def parse_lsof(out):
@@ -269,6 +292,9 @@ class State:
         self.files_note = ""   # why the Files/Events views are empty (e.g. fatrace missing)
         self.file_bytes = IS_MAC   # False when per-file byte counts are unavailable (Linux)
         # macOS: reads/writes on fds opened before we started are resolved later with lsof
+        self.names = {}            # truncated fs_usage name -> full name (macOS)
+        self.trunc = set()         # truncated names waiting to be expanded
+        self.name_tried = set()
         self.resolver_on = False
         self.resolved = {}         # (proc, fd) -> path/label found by lsof
         self.unk = {}              # (proc, fd) -> [ops, rbytes, wbytes] waiting for resolution
@@ -286,8 +312,9 @@ class State:
         if self.resolver_on and ev["proc"] == "lsof":
             return      # our own resolver: counting it would feed back into more lookups
         now = time.time()
-        call, proc, fd = ev["call"], ev["proc"], ev["fd"]
-        key = (proc, fd)
+        call, raw_proc, fd = ev["call"], ev["proc"], ev["fd"]
+        key = (raw_proc, fd)                         # fd bookkeeping and lsof use fs_usage's own name
+        proc = self.names.get(raw_proc, raw_proc)    # counters and the display use the full name
         path = ev["path"]
         if call in OPEN_CALLS and fd is not None and path:
             if len(self.fdmap) > MAX_FDS:
@@ -303,6 +330,8 @@ class State:
         w = ev["nbytes"] if call in WRITE_CALLS else 0
         unknown = not path and fd is not None and (r or w)
         with self.lock:
+            if len(raw_proc) >= 31 and raw_proc not in self.names and raw_proc not in self.name_tried:
+                self.trunc.add(raw_proc)
             self.procs[proc].add(now, r, w)
             self.total.add(now, r, w)
             if path or r or w:
@@ -322,6 +351,27 @@ class State:
         u[0] += 1
         u[1] += r
         u[2] += w
+
+    def take_truncated(self):
+        with self.lock:
+            todo, self.trunc = self.trunc, set()
+            self.name_tried.update(todo)
+            if len(self.name_tried) > 5000:
+                self.name_tried.clear()
+            return todo
+
+    def apply_names(self, mapping):
+        """Remember full names and fold the counters already collected under the truncated name into them."""
+        with self.lock:
+            for raw, full in mapping.items():
+                self.names[raw] = full
+                c = self.procs.pop(raw, None)
+                if c:
+                    t = self.procs[full]
+                    t.ops += c.ops
+                    t.rbytes += c.rbytes
+                    t.wbytes += c.wbytes
+                    t.events = collections.deque(sorted(list(t.events) + list(c.events)))
 
     def take_pending(self):
         """{proc: {fds}} still to look up; marks them as tried."""
@@ -435,6 +485,18 @@ class FatraceReader(CmdReader):
             self.state.add_file_event(ev, line)
 
 
+class NameResolver(Source):
+    """macOS: expand names that fs_usage truncated to full process names, using `ps`."""
+
+    def run(self):
+        while not self._halt.wait(2.0):
+            todo = self.state.take_truncated()
+            if todo:
+                mapping = expand_names(todo, ps_command_names())
+                if mapping:
+                    self.state.apply_names(mapping)
+
+
 class FdResolver(Source):
     """macOS: fs_usage only prints a path when a file is opened; look up older fds with lsof, about once a second."""
 
@@ -488,7 +550,7 @@ class ProcReader(Source):
 def make_sources(state):
     """Pick the data sources for this OS and record limitations on `state`."""
     if IS_MAC:
-        srcs = [FsUsageReader(state)]
+        srcs = [FsUsageReader(state), NameResolver(state)]
         if shutil.which("lsof"):
             state.resolver_on = True
             srcs.append(FdResolver(state))
@@ -632,12 +694,13 @@ VIEWS = ["Processes", "Files", "Statistics", "Events"]
 
 def view_processes(ctx):
     now, terms = ctx["now"], ctx["terms"]
-    hdr = f"{'PROCESS':<30}{'OPS':>10}{'READ':>10}{'WRITTEN':>10}{'READ/s':>11}{'WRITE/s':>11}"
+    pw = max(20, min(44, ctx["w"] - 53))
+    hdr = f"{'PROCESS':<{pw}}{'OPS':>10}{'READ':>10}{'WRITTEN':>10}{'READ/s':>11}{'WRITE/s':>11}"
     items = [(n, c) for n, c in ctx["procs"] if match(n, "", terms)]
     rows = []
     for n, c in sort_items(items, ctx["sort"], now):
         r, w = c.rates(now)
-        rows.append(f"{fit(n, 30)}{c.ops:>10}{hb(c.rbytes):>10}{hb(c.wbytes):>10}{hr(r):>11}{hr(w):>11}")
+        rows.append(f"{fit(n, pw)}{c.ops:>10}{hb(c.rbytes):>10}{hb(c.wbytes):>10}{hr(r):>11}{hr(w):>11}")
     return hdr, rows
 
 
@@ -925,7 +988,7 @@ def once(flt, duration):
         procs, paths = list(st.procs.items()), list(st.paths.items())
     print(f"== Processes (last {duration:g}s) ==")
     for n, c in sort_items([(n, c) for n, c in procs if match(n, "", terms)], "total", now)[:15]:
-        print(f"{fit(n, 30)} ops {c.ops:>8}  read {hb(c.rbytes):>7}  written {hb(c.wbytes):>7}")
+        print(f"{fit(n, 40)} ops {c.ops:>8}  read {hb(c.rbytes):>7}  written {hb(c.wbytes):>7}")
     print("== Top files ==")
     if st.files_note and not paths:
         print(st.files_note)
