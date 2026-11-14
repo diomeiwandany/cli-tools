@@ -426,8 +426,8 @@ class State:
             self.log.append((ev["ts"], ev["proc"], ev["path"], raw.rstrip("\n")))
 
     def tick(self, now):
-        """Record one throughput sample per second (called from the UI loop). Caller holds the lock."""
-        if now - self._ht >= 1.0:
+        """Record one throughput sample per second (called by Sampler). Caller holds the lock."""
+        if now - self._ht >= 0.9:
             self._ht = now
             self.hist.append(self.total.rates(now))
 
@@ -484,6 +484,15 @@ class FatraceReader(CmdReader):
         ev = parse_fatrace(line)
         if ev and ev["pid"] != os.getpid():
             self.state.add_file_event(ev, line)
+
+
+class Sampler(Source):
+    """Records the throughput history once a second, whatever the screen refresh interval is."""
+
+    def run(self):
+        while not self._halt.wait(1.0):
+            with self.state.lock:
+                self.state.tick(time.time())
 
 
 class NameResolver(Source):
@@ -551,14 +560,14 @@ class ProcReader(Source):
 def make_sources(state):
     """Pick the data sources for this OS and record limitations on `state`."""
     if IS_MAC:
-        srcs = [FsUsageReader(state), NameResolver(state)]
+        srcs = [FsUsageReader(state), NameResolver(state), Sampler(state)]
         state.helpers.add("ps")
         if shutil.which("lsof"):
             state.resolver_on = True
             state.helpers.add("lsof")
             srcs.append(FdResolver(state))
         return srcs
-    srcs = [ProcReader(state)]
+    srcs = [ProcReader(state), Sampler(state)]
     root = os.geteuid() == 0
     if not root:
         state.note = "not root: only your own processes are visible"
@@ -643,11 +652,11 @@ def addstr(win, y, x, s, attr=0):
 
 
 def spark(vals, width):
+    """Sparkline of the newest `width` values, always exactly `width` cells: history fills in from the
+    right edge and scrolls left, so whatever is printed after the graph stays in a fixed column."""
     vals = list(vals)[-width:]
-    if not vals:
-        return ""
-    m = max(vals) or 1
-    return "".join(SPARK[min(8, int(v / m * 8))] for v in vals)
+    m = max(vals, default=0) or 1
+    return "".join(SPARK[min(8, int(v / m * 8))] for v in vals).rjust(width)
 
 
 # -------------------------------------------------------------- filter + sort
@@ -741,8 +750,8 @@ def view_statistics(ctx):
         f"Processes seen   {ctx['n_procs']:,}",
         f"Files seen       {ctx['n_paths']:,}",
         "",
-        f"READ  {spark([x[0] for x in hh], sw)}  {hr(r)}",
-        f"WRITE {spark([x[1] for x in hh], sw)}  {hr(w)}",
+        f"READ  {spark([x[0] for x in hh], sw)}  {fit(hr(r), 10)}",
+        f"WRITE {spark([x[1] for x in hh], sw)}  {fit(hr(w), 10)}",
     ]
     return "Throughput history (newest right); each line scaled to its own max", rows
 
@@ -839,7 +848,6 @@ def build_ctx(scr, state, ui_state):
     h, w = scr.getmaxyx()
     now = time.time()
     with state.lock:
-        state.tick(now)
         ctx = dict(
             h=h, w=w, now=now, state=state, ui=ui_state,
             procs=list(state.procs.items()) if ui_state["view"] == 0 else [],
