@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""netmon - an iptraf-ng style network traffic monitor for macOS.
+"""netmon - an iptraf-ng style network traffic monitor for macOS and Linux.
 
 Stdlib only, no root needed. macOS: `netstat -ibn` + `nettop`. Linux (Debian/RHEL/Arch/SUSE/Alpine):
 /proc/net/dev + `ss` (iproute2). Optional `tcpdump` enables the Packets/Protocols views.
 Missing tools are offered for install via brew / apt / dnf / yum / pacman / zypper / apk.
 
-    python3 netmon.py [--interval S] [--capture] [-i IFACE]
+    python3 netmon.py [--interval S] [--capture] [-i IFACE] [--unit auto|bps|Kbps|Mbps|MBps]   (default Mbps)
     python3 netmon.py --once [--filter TEXT]    |  --selftest  |  --install [-y]
 
-Keys: 1-4 views | up/down scroll | s sort | r reverse DNS | p pause | q quit
+Keys: 1-6 views | up/down scroll | s sort | u rate unit | r reverse DNS | p pause | q quit
 """
 import atexit
 import curses
@@ -642,8 +642,47 @@ def hb(n):
         n /= 1024
 
 
-def hr(n):
-    return hb(n) + "/s"
+# Transfer-rate units (default Mbps). "auto" is bytes/s (B, K, M, G...). The others are fixed units: bits per second in
+# decimal steps (bps, Kbps, Mbps) or megabytes per second (MBps). A value that would overflow its column
+# moves up to the next prefix (Mbps -> Gbps) instead of being cut off.
+RATE_UNITS = ["auto", "bps", "Kbps", "Mbps", "MBps"]
+_RATE_LADDERS = {"bits": [("bps", 1), ("Kbps", 1e3), ("Mbps", 1e6), ("Gbps", 1e9), ("Tbps", 1e12)],
+                 "bytes": [("MBps", 1e6), ("GBps", 1e9), ("TBps", 1e12)]}
+DEFAULT_RATE_UNIT = "Mbps"
+_RATE = {"unit": DEFAULT_RATE_UNIT}
+
+
+def rate_unit_from(text):
+    """Exact names, or all-lowercase 'kbps'/'mbps' (bits). Mixed-case typos like 'mBps' are rejected, because
+    megabits vs megabytes is a factor of 8 and must be spelled exactly 'Mbps' / 'MBps'. None if unknown."""
+    t = (text or "").strip()
+    if t in RATE_UNITS:
+        return t
+    return {"kbps": "Kbps", "mbps": "Mbps"}.get(t) if t == t.lower() else None
+
+
+def cycle_rate_unit():
+    _RATE["unit"] = RATE_UNITS[(RATE_UNITS.index(_RATE["unit"]) + 1) % len(RATE_UNITS)]
+
+
+def _num(v):
+    return f"{v:.2f}" if v < 10 else f"{v:.1f}" if v < 100 else f"{v:.0f}"
+
+
+def hr(n, width=9):
+    """Format a rate given in bytes/s using the selected unit."""
+    unit = _RATE["unit"]
+    if unit == "auto":
+        return hb(n) + "/s"
+    ladder = _RATE_LADDERS["bytes" if unit == "MBps" else "bits"]
+    val = float(n) * (1 if unit == "MBps" else 8)
+    i = [name for name, _ in ladder].index(unit)
+    while True:
+        name, scale = ladder[i]
+        txt = f"{_num(val / scale)} {name}"
+        if len(txt) <= width or i == len(ladder) - 1:
+            return txt
+        i += 1
 
 
 def cw(ch):
@@ -699,11 +738,11 @@ def draw_segs(scr, y, w, segs, attr):
 
 
 def spark(vals, width):
+    """Sparkline of the newest `width` values, always exactly `width` cells: history fills in from the
+    right edge, so whatever is printed after the graph stays in a fixed column."""
     vals = list(vals)[-width:]
-    if not vals:
-        return ""
-    m = max(vals) or 1
-    return "".join(SPARK[min(8, int(v / m * 8))] for v in vals)
+    m = max(vals, default=0) or 1
+    return "".join(SPARK[min(8, int(v / m * 8))] for v in vals).rjust(width)
 
 
 class DNS:
@@ -851,8 +890,8 @@ def view_statistics(ctx):
     rows = []
     for n in sorted(ctx["ifs"]):
         hh = ctx["hist"].get(n, [])
-        rows.append(f"{fit(n,8)}IN  {spark([x[0] for x in hh], sw)}  {hr(ctx['ifs'][n]['in_rate'])}")
-        rows.append(f"{'':<8}OUT {spark([x[1] for x in hh], sw)}  {hr(ctx['ifs'][n]['out_rate'])}")
+        rows.append(f"{fit(n,8)}IN  {spark([x[0] for x in hh], sw)}  {fit(hr(ctx['ifs'][n]['in_rate']), 10)}")
+        rows.append(f"{'':<8}OUT {spark([x[1] for x in hh], sw)}  {fit(hr(ctx['ifs'][n]['out_rate']), 10)}")
     return hdr, rows
 
 
@@ -960,13 +999,14 @@ def bar_columns(ctx, nrows):
         ("on" if dns.on else "off", "r", "DNS", False),
         ("PAUSED" if col.paused else "running", "p", "Pause", False),
         (f"{col.interval:g}s", "+/-", "Refresh", False),
+        (_RATE["unit"], "u", "Unit", False),
         (f"ON {cap.iface}" if cap.on and cap.status == "ON" else ("..." if cap.on else cap.status[:10]), "c", "Capture", False),
         (VIEWS[view], "1-6", "Views", False),
         (f"{nrows} rows", "q", "Quit", False),
     ], sortlbl
 
 
-BAR_MINW = [0, 3, 6, 5, 3, 7, 4, 10, max(len(x) for x in VIEWS), 9]   # widest value each column can show
+BAR_MINW = [0, 3, 6, 5, 3, 7, 4, 4, 10, max(len(x) for x in VIEWS), 9]   # widest value each column can show
 
 
 def draw_bottombar(scr, ctx, nrows):
@@ -1018,6 +1058,17 @@ def draw(scr, col, st, dns, cap):
     scr.refresh()
 
 
+def init_rate_unit():
+    """--unit auto|bps|Kbps|Mbps|MBps sets the starting unit (the u key cycles it)."""
+    v = arg_value("--unit")
+    if v is None:
+        return
+    unit = rate_unit_from(v)
+    if unit is None:
+        raise SystemExit(f"netmon: unknown --unit '{v}' (choose: {', '.join(RATE_UNITS)}; MBps = megabytes/s, Mbps = megabits/s)")
+    _RATE["unit"] = unit
+
+
 def interval_arg():
     a = sys.argv
     try:
@@ -1065,6 +1116,8 @@ def ui(scr):
             st["scroll"] -= 10
         elif k == ord("s"):
             st["sort"] += 1
+        elif k == ord("u"):
+            cycle_rate_unit()
         elif k == ord("r"):
             dns.on = not dns.on
         elif k == ord("t"):
@@ -1120,6 +1173,7 @@ def once(flt=""):
 
 if __name__ == "__main__":
     be = get_backend()                       # detects the OS and exits cleanly if unsupported
+    init_rate_unit()
     assume = "-y" in sys.argv or "--yes" in sys.argv
     if "--selftest" in sys.argv:
         sys.exit(selftest())
