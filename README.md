@@ -8,6 +8,7 @@ It always asks first; pass `-y` to skip the question.
 |------|--------------|-------|-------|
 | `netmon.py` | iptraf-ng style network monitor | `netstat`, `nettop` (built in); optional `tcpdump` | `ss` (iproute2); optional `tcpdump` |
 | `diskmon.py` | iptraf-ng style file / disk I/O monitor (needs root on macOS) | `fs_usage` (built in), root | `/proc` (built in); optional `fatrace` + root for the per-file views |
+| `jname` | DNS overview of a domain (A, AAAA, www, NS, MX, TXT, SOA, CAA, DMARC); POSIX `sh`, `-s SERVER` to pick a resolver | `dig` (built in) | `dig` (`dnsutils` / `bind-utils` / `bind-tools`) |
 | `usbbootmaker.py` | bootable USB drives from Windows / Linux images | `diskutil`, `hdiutil` (built in); `wimlib` for Windows ISOs with files over 4 GB | `lsblk`, `parted`, `mkfs.vfat`/`mkfs.exfat`, `mount`/`umount`, `blockdev`; `wimlib` |
 
 ## Checking and installing requirements
@@ -20,6 +21,8 @@ python3 diskmon.py --selftest
 python3 diskmon.py --install [-y]
 
 python3 usbbootmaker.py --check [-y]
+
+./jname example.com                 # asks to install dig if it is missing (-y: don't ask)
 ```
 
 Homebrew itself is never installed automatically; if it is missing the tools point to https://brew.sh.
