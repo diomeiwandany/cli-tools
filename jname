@@ -1,22 +1,29 @@
 #!/bin/sh
-# jname - quick DNS overview of a domain: A, AAAA, www, NS, MX, TXT, SOA, CAA and DMARC.
+# jname - quick DNS overview of a domain: A, AAAA, www, NS, MX, TXT and DMARC.
 #
 # POSIX sh: runs the same on macOS and Linux. Needs `dig`; if it is missing jname offers to install it
 # (brew on macOS; apt-get, dnf, yum, pacman, zypper or apk on Linux).
 #
 #   jname example.com
 #   jname -s 1.1.1.1 example.com
+#   jname -r -t dmarc example.com | pbcopy       # just the DMARC value, ready to paste
 set -u
 
 PROG=${0##*/}
 
 usage() {
     cat <<EOF
-Usage: $PROG [-s SERVER] [-y] DOMAIN
+Usage: $PROG [-t TYPE] [-r] [-s SERVER] [-y] DOMAIN
 
+  -t TYPE     only look up this record: a, aaaa, www, ns, mx, txt or dmarc (repeat for several)
+  -r          raw output for copying: only the values, one per line, no table. TXT values come out
+              unquoted, with dig's 255-byte chunks joined and escapes such as \; undone
   -s SERVER   ask this DNS server (name or IP) instead of the system resolver
   -y          install dig without asking if it is missing
   -h          show this help
+
+Examples:   $PROG example.com
+            $PROG -r -t txt example.com | pbcopy
 
 Exit codes: 0 ok, 1 bad usage, 2 domain does not exist (NXDOMAIN),
             3 a DNS lookup failed or timed out, 127 dig is missing
@@ -32,15 +39,26 @@ die() {  # die CODE MESSAGE
 SERVER=""
 ASSUME_YES=0
 DOMAIN=""
+WANT=""     # record groups chosen with -t (empty = all of them)
+RAW=0
 while [ $# -gt 0 ]; do
     case $1 in
         -h|--help) usage; exit 0 ;;
         -y|--yes) ASSUME_YES=1 ;;
+        -r|--raw) RAW=1 ;;
+        -t) [ $# -ge 2 ] || die 1 "-t needs a record type"
+            t=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+            case $t in
+                a|aaaa|www|ns|mx|txt|dmarc) WANT="$WANT $t" ;;
+                *) die 1 "unknown record type '$2' (use: a aaaa www ns mx txt dmarc)" ;;
+            esac
+            shift ;;
         -s) [ $# -ge 2 ] || die 1 "-s needs a server name or address"
             SERVER=$2
             shift ;;
         -*) die 1 "unknown option: $1 (try -h)" ;;
-        *) [ -z "$DOMAIN" ] || die 1 "give one domain at a time"
+        *) [ -n "$1" ] || die 1 "empty argument"
+           [ -z "$DOMAIN" ] || die 1 "give one domain at a time"
            DOMAIN=$1 ;;
     esac
     shift
@@ -51,6 +69,11 @@ if [ -z "$DOMAIN" ]; then
 fi
 
 # The domain and server end up on dig's command line, so only accept plain, safe names.
+# (grep checks line by line, so a value with a newline in it must be rejected up front.)
+nl=$(printf '\n.'); nl=${nl%.}
+case $DOMAIN$SERVER in
+    *"$nl"*) die 1 "the domain and server must be a single line" ;;
+esac
 if printf '%s' "$DOMAIN" | LC_ALL=C grep -q '[^ -~]'; then
     die 1 "non-ASCII domain: use the punycode form (xn--...)"
 fi
@@ -119,11 +142,17 @@ command -v dig >/dev/null 2>&1 || install_dig
 FAILED=0
 STATUS=""
 ROWS=""
+RAN=0       # number of lookups actually run
+FIRST=1     # the first lookup decides whether the domain exists
+
+warn_raw() {  # in raw mode stdout carries only values, so problems go to stderr as they happen
+    [ "$RAW" -eq 0 ] || printf '%s: %s\n' "$PROG" "$1" >&2
+}
 
 # lookup GROUP TYPE NAME: one dig query. Appends tab-separated rows (group, type, name, ttl, value) to ROWS
 # and sets STATUS (NOERROR, NXDOMAIN, TIMEOUT, ...). Nothing is printed here; the table is drawn at the end.
 lookup() {
-    out=$(dig +noall +answer +comments +time=3 +tries=1 ${SERVER:+"@$SERVER"} "$3" "$2" 2>&1)
+    out=$(dig +noall +answer +comments +time=3 +tries=2 ${SERVER:+"@$SERVER"} "$3" "$2" 2>&1)
     rc=$?
     STATUS=$(printf '%s\n' "$out" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -n 1)
     if [ "$rc" -eq 9 ]; then
@@ -134,9 +163,9 @@ lookup() {
     msg=""
     case $STATUS in
         NOERROR) ;;
-        NXDOMAIN) return 0 ;;
-        TIMEOUT) msg="(no answer from ${SERVER:-the system resolver})"; FAILED=1 ;;
-        *) msg="(lookup failed: $STATUS)"; FAILED=1 ;;
+        NXDOMAIN) msg="(no such name)" ;;      # a real answer (e.g. no www or _dmarc), not a failure
+        TIMEOUT) msg="(no answer from ${SERVER:-the system resolver})"; FAILED=1; warn_raw "$2 $3: $msg" ;;
+        *) msg="(lookup failed: $STATUS)"; FAILED=1; warn_raw "$2 $3: $msg" ;;
     esac
     if [ -z "$msg" ]; then
         found=$(printf '%s\n' "$out" | grep -v '^;' | grep -v '^[[:space:]]*$' | awk -v g="$1" '{
@@ -170,25 +199,14 @@ table_width() {
     printf '%s' "$w"
 }
 
-# Draws ROWS as a grid: "|" between columns, "+---+" rules above, below and between lookups, "+===+" under the
-# header. Columns are as wide as their longest entry; a long VALUE wraps inside its cell to fit the terminal.
+# Draws ROWS as a table with horizontal rules only: "----" above, below and between lookups, "====" under the
+# header. Columns are as wide as their longest entry. Nothing is wrapped: a long NAME or VALUE stays on one line
+# (VALUE is the last, unpadded column), so it can be selected and copied intact; the terminal soft-wraps it for
+# display if it is wider than the screen. Only the rules are limited to the terminal width.
 print_table() {
     printf '%s\n' "$ROWS" | awk -v maxw="$(table_width)" '
         function rep(c, len,   out) { out = ""; while (len-- > 0) out = out c; return out }
-        function rule(c) { return "+" c rep(c, ct) c "+" c rep(c, cn) c "+" c rep(c, cl) c "+" c rep(c, cv) c "+" }
-        # split s into pieces of at most w characters, preferring to break at a space; returns the count
-        function wrap(s, w, parts,   n, cut, i, sp) {
-            split("", parts)
-            n = 0
-            while (length(s) > w) {
-                cut = w; sp = 0
-                for (i = w; i > int(w * 0.6); i--) if (substr(s, i, 1) == " ") { cut = i; sp = 1; break }
-                if (sp) { parts[++n] = substr(s, 1, cut - 1); s = substr(s, cut + 1) }
-                else    { parts[++n] = substr(s, 1, w);       s = substr(s, w + 1) }
-            }
-            parts[++n] = s
-            return n
-        }
+        function row(a, b, c, d,   line) { line = sprintf(fmt, a, b, c, d); sub(/ +$/, "", line); print line }
         BEGIN { FS = "\t" }
         NF < 5 { next }
         {
@@ -202,46 +220,121 @@ print_table() {
             if (ct < 4) ct = 4
             if (cn < 4) cn = 4
             if (cl < 3) cl = 3
-            room = maxw - (ct + cn + cl) - 13          # 13 = the borders and padding around four columns
-            if (room < 20) room = 20
-            cv = (wv < room) ? wv : room
-            if (cv < 5) cv = 5
-            fmt = "| %-" ct "s | %-" cn "s | %" cl "s | %-" cv "s |\n"
-            print rule("-")
-            printf fmt, "TYPE", "NAME", "TTL", "VALUE"
-            print rule("=")
+            if (wv < 5) wv = 5
+            total = ct + cn + cl + wv + 6               # 6 = the two spaces between the four columns
+            if (total > maxw) total = maxw
+            fmt = "%-" ct "s  %-" cn "s  %" cl "s  %s"
+            print rep("-", total)
+            row("TYPE", "NAME", "TTL", "VALUE")
+            print rep("=", total)
             for (i = 1; i <= k; i++) {
-                if (i > 1 && gg[i] != gg[i - 1]) print rule("-")
-                m = wrap(vv[i], cv, parts)
-                printf fmt, tt[i], nn[i], ll[i], parts[1]
-                for (j = 2; j <= m; j++) printf fmt, "", "", "", parts[j]
+                if (i > 1 && gg[i] != gg[i - 1]) print rep("-", total)
+                row(tt[i], nn[i], ll[i], vv[i])
             }
-            print rule("-")
+            print rep("-", total)
         }'
 }
 
-printf '\n'
-echo "Here's your request of domain: $DOMAIN   (resolver: ${SERVER:-system default})"
-printf '\n'
+# -r: only the values, one per line. Rows without a TTL are "(none)" / "(no such name)" / failures: skipped.
+# TXT values are turned into the string they actually hold: quotes dropped, 255-byte chunks joined, and dig's
+# presentation escapes undone (\; -> ;  \" -> "  \\ -> \  \032 -> a space).
+print_raw() {
+    printf '%s\n' "$ROWS" | awk '
+        function unesc(s,   out, i, c, d) {
+            out = ""
+            for (i = 1; i <= length(s); i++) {
+                c = substr(s, i, 1)
+                if (c != "\\") { out = out c; continue }
+                d = substr(s, i + 1, 3)
+                if (d ~ /^[0-9][0-9][0-9]$/ && d + 0 >= 32 && d + 0 < 127) { out = out sprintf("%c", d + 0); i += 3 }
+                else if (d ~ /^[0-9][0-9][0-9]$/) { out = out c }
+                else { out = out substr(s, i + 1, 1); i++ }
+            }
+            return out
+        }
+        BEGIN { FS = "\t" }
+        NF >= 5 && $4 != "-" {
+            v = $5
+            if ($2 == "TXT") { gsub(/" "/, "", v); sub(/^"/, "", v); sub(/"$/, "", v); v = unesc(v) }
+            print v
+        }'
+}
 
-lookup A A "$DOMAIN"
-case $STATUS in
-    NXDOMAIN) echo "$DOMAIN does not exist (NXDOMAIN)."; printf '\n'; exit 2 ;;
-    TIMEOUT)  echo "Giving up: the DNS server did not answer."; printf '\n'; exit 3 ;;
-esac
-lookup AAAA AAAA "$DOMAIN"
+# fail CODE MESSAGE: stop early (NXDOMAIN, no answer). Raw mode keeps stdout clean and uses stderr.
+fail() {
+    if [ "$RAW" -eq 1 ]; then
+        printf '%s: %s\n' "$PROG" "$2" >&2
+    else
+        echo "$2"
+        printf '\n'
+    fi
+    exit "$1"
+}
+
+# True unless the domain itself is NXDOMAIN (needed when the first lookup is for www. or _dmarc., whose
+# NXDOMAIN only means that name is missing).
+domain_exists() {
+    st=$(dig +noall +comments +time=3 +tries=2 ${SERVER:+"@$SERVER"} "$DOMAIN" A 2>&1 | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -n 1)
+    [ "$st" != "NXDOMAIN" ]
+}
+
+want() {  # want GROUP: true if -t picked it, or if -t was not used
+    [ -z "$WANT" ] && return 0
+    g=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$WANT " in
+        *" $g "*) return 0 ;;
+    esac
+    return 1
+}
+
+# step GROUP TYPE NAME: run one lookup if it was selected. The first one run decides whether to go on.
+step() {
+    want "$1" || return 0
+    lookup "$1" "$2" "$3"
+    RAN=$((RAN + 1))
+    if [ "$FIRST" -eq 1 ]; then
+        FIRST=0
+        case $STATUS in
+            NXDOMAIN)
+                if [ "$3" = "$DOMAIN" ] || ! domain_exists; then
+                    fail 2 "$DOMAIN does not exist (NXDOMAIN)."
+                fi ;;
+            TIMEOUT) fail 3 "Giving up: the DNS server did not answer." ;;
+        esac
+    fi
+}
+
+# "-t www" alone makes no sense for a name that already starts with www.: say so before printing anything.
+if [ -n "$WANT" ] && [ -z "$(printf '%s' "$WANT" | sed 's/ www//g')" ]; then
+    case $DOMAIN in
+        www.*) die 1 "-t www does not apply to '$DOMAIN', which already starts with www." ;;
+    esac
+fi
+
+if [ "$RAW" -ne 1 ]; then
+    printf '\n'
+    echo "Here's your request of domain: $DOMAIN   (resolver: ${SERVER:-system default})"
+    printf '\n'
+fi
+
+step A A "$DOMAIN"
+step AAAA AAAA "$DOMAIN"
 case $DOMAIN in
     www.*) ;;
-    *) lookup WWW A "www.$DOMAIN" ;;
+    *) step WWW A "www.$DOMAIN" ;;
 esac
-lookup NS NS "$DOMAIN"
-lookup MX MX "$DOMAIN"
-lookup TXT TXT "$DOMAIN"
-lookup SOA SOA "$DOMAIN"
-lookup CAA CAA "$DOMAIN"
-lookup DMARC TXT "_dmarc.$DOMAIN"
+step NS NS "$DOMAIN"
+step MX MX "$DOMAIN"
+step TXT TXT "$DOMAIN"
+step DMARC TXT "_dmarc.$DOMAIN"
 
-print_table
-printf '\n'
+[ "$RAN" -gt 0 ] || die 1 "nothing to look up for $DOMAIN with -t$WANT"
+
+if [ "$RAW" -eq 1 ]; then
+    print_raw
+else
+    print_table
+    printf '\n'
+fi
 [ "$FAILED" -eq 0 ] || exit 3
 exit 0
