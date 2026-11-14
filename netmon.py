@@ -27,7 +27,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 
 HIST = 120
-SMOOTH = 3                        # samples in the rate moving average
+SMOOTH = 2                        # samples in the rate moving average (higher = steadier but laggier)
 INTERVALS = [0.5, 1, 2, 5, 10]    # selectable refresh intervals (s)
 SPARK = " ▁▂▃▄▅▆▇█"
 
@@ -320,7 +320,7 @@ class MacBackend(Backend):
         return parse_netstat(run(["netstat", "-ibn"]))
 
     def read_connections(self):
-        return parse_nettop(run(["nettop", "-x", "-L", "1", "-s", "1", "-J", "state,bytes_in,bytes_out"], timeout=15))
+        return parse_nettop(run(["nettop", "-x", "-n", "-L", "1", "-J", "state,bytes_in,bytes_out"], timeout=15))  # -n: no name lookups (they block ~5 s)
 
     def default_iface(self):
         for l in run(["route", "-n", "get", "default"]).splitlines():
