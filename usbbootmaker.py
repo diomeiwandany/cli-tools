@@ -7,6 +7,7 @@ by reading the device back; Windows file copies are not read back.
 
     python3 usbbootmaker.py            # interactive menu
     python3 usbbootmaker.py --list     # list removable drives and exit
+    python3 usbbootmaker.py --check    # check tools, offer to install missing ones
     python3 usbbootmaker.py --help
 
 Standard library only. Writing to drives needs root; the script re-launches
@@ -838,6 +839,30 @@ def ensure_wimlib(assume_yes: bool = False, dry_run: bool = False) -> str:
     return found
 
 
+def check_deps(assume_yes: bool = False) -> int:
+    """`--check`: report every tool this platform may need and offer to install what is missing."""
+    info(f"Platform: {platform.system()} {platform.release()}")
+    if not (IS_MAC or IS_LINUX):
+        raise CliError("Only macOS and Linux are supported.")
+    builtin = ["diskutil", "hdiutil"] if IS_MAC else []
+    linux_tools = ["lsblk", "umount", "blockdev", "mount", "parted", "mkfs.vfat", "mkfs.exfat"] if IS_LINUX else []
+    missing_builtin = [t for t in builtin if find_tool(t) is None]
+    for tool in builtin + linux_tools + ["wimlib-imagex"]:
+        found = find_wimlib() if tool == "wimlib-imagex" else find_tool(tool)
+        print(f"  {tool:<14} {green('OK ') + dim(found) if found else yellow('MISSING')}")
+    if missing_builtin:
+        raise CliError("These ship with macOS and are missing: " + ", ".join(missing_builtin)
+                       + ". Check your PATH or reinstall the system tools.")
+    if IS_LINUX:
+        ensure_linux_tools(linux_tools, assume_yes)
+    try:
+        ensure_wimlib(assume_yes)      # needed only for Windows ISOs with an install.wim over 4 GB on FAT32
+    except CliError as e:
+        warn(str(e).splitlines()[0])
+    ok("All required tools are available." if not missing_tools(linux_tools) else "Some tools are still missing.")
+    return 0
+
+
 def preflight(image: str, opts: "Options", assume_yes: bool = False) -> None:
     """Checks that must pass before anything is erased or written (and before any sudo restart)."""
     kind = classify_image(image)
@@ -1358,6 +1383,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="USB Boot Maker CLI: bootable USB drives from Windows and Linux images. "
                     "Run without arguments for the interactive menu.")
     p.add_argument("--list", action="store_true", help="list removable drives and exit")
+    p.add_argument("--check", action="store_true",
+                   help="check required tools and offer to install missing ones (brew / apt / dnf / ...)")
     p.add_argument("--all", action="store_true", help="include internal drives in scans (dangerous)")
     p.add_argument("--image", help="ISO / .img / .gz file, or a folder with Windows installer files")
     p.add_argument("--device", help="target: device name (disk4, sdb), /dev path, or a plain file for testing")
@@ -1391,6 +1418,8 @@ def resolve_device(spec: str, include_internal: bool) -> Drive:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.check:
+            return check_deps(args.yes)
         if args.list:
             print_drives(scan_drives(args.all))
             return 0

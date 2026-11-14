@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """netmon - an iptraf-ng style network traffic monitor for macOS.
 
-Stdlib only, no root needed. Data comes from `netstat -ibn` (interfaces) and
-`nettop` (per-process / per-connection byte counters).
+Stdlib only, no root needed. macOS: `netstat -ibn` + `nettop`. Linux (Debian/RHEL/Arch/SUSE/Alpine):
+/proc/net/dev + `ss` (iproute2). Optional `tcpdump` enables the Packets/Protocols views.
+Missing tools are offered for install via brew / apt / dnf / yum / pacman / zypper / apk.
+
+    python3 netmon.py [--interval S] [--capture] [-i IFACE]
+    python3 netmon.py --once [--filter TEXT]    |  --selftest  |  --install [-y]
 
 Keys: 1-4 views | up/down scroll | s sort | r reverse DNS | p pause | q quit
 """
@@ -127,6 +131,78 @@ def detect_os(system=None, os_release=None):
     return dict(family="linux-other", name=name)
 
 
+# ------------------------------------------------------- package install assistance
+PKG_ORDER = ["brew", "apt-get", "dnf", "yum", "pacman", "zypper", "apk"]
+PKG_INSTALL = {"brew": ["install"], "apt-get": ["apt-get", "install", "-y"], "dnf": ["dnf", "install", "-y"],
+               "yum": ["yum", "install", "-y"], "pacman": ["pacman", "-S", "--noconfirm"],
+               "zypper": ["zypper", "--non-interactive", "install"], "apk": ["apk", "add"]}
+_IPROUTE = {"apt-get": "iproute2", "dnf": "iproute", "yum": "iproute", "pacman": "iproute2",
+            "zypper": "iproute2", "apk": "iproute2"}
+PKG_MAP = {"ss": _IPROUTE, "ip": _IPROUTE,                       # tool -> {package manager: package}
+           "tcpdump": {m: "tcpdump" for m in PKG_ORDER}}
+
+
+def find_brew():
+    found = shutil.which("brew")
+    if found:
+        return found
+    return next((p for p in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew") if os.access(p, os.X_OK)), None)
+
+
+def detect_pkg_manager():
+    if platform.system() == "Darwin":
+        return "brew" if find_brew() else None
+    return next((m for m in PKG_ORDER[1:] if shutil.which(m)), None)
+
+
+def install_command(manager, packages):
+    """Full command (with sudo when needed) that installs `packages`, or None if it can't be built."""
+    if manager == "brew":
+        cmd = [find_brew()] + PKG_INSTALL["brew"] + packages
+        if os.geteuid() == 0 and os.environ.get("SUDO_USER"):    # Homebrew refuses to run as root
+            cmd = ["sudo", "-u", os.environ["SUDO_USER"]] + cmd
+        return cmd
+    if not manager:
+        return None
+    if os.geteuid() != 0:
+        if not shutil.which("sudo"):
+            return None
+        return ["sudo"] + PKG_INSTALL[manager] + packages
+    return PKG_INSTALL[manager] + packages
+
+
+def offer_install(tools, assume_yes=False, required=True):
+    """Offer to install missing tools with brew/apt/dnf/... Never installs without asking (unless -y).
+    Returns the tools that are still missing afterwards."""
+    mgr = detect_pkg_manager()
+    pkgs = []
+    for t in tools:
+        p = PKG_MAP.get(t, {}).get(mgr) if mgr else None
+        if p and p not in pkgs:
+            pkgs.append(p)
+    cmd = install_command(mgr, pkgs) if pkgs else None
+    print(f"netmon: missing {'required' if required else 'optional'} tool(s): {', '.join(tools)}")
+    if not cmd:
+        if platform.system() == "Darwin" and not mgr:
+            print("  Homebrew is not installed. Get it from https://brew.sh, then re-run.")
+        else:
+            print("  No supported package manager (or sudo) found; install them manually.")
+        return list(tools)
+    print("  install with: " + " ".join(cmd))
+    if not assume_yes:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return list(tools)
+        try:
+            ans = input("  Run it now? [Y/n] " if required else "  Run it now? [y/N] ").strip().lower()
+        except EOFError:
+            return list(tools)
+        if not (ans in ("y", "yes") or (required and ans == "")):
+            return list(tools)
+    if subprocess.run(cmd).returncode != 0:
+        print("  install failed; try the command above manually.")
+    return [t for t in tools if not shutil.which(t)]
+
+
 SS_STATES = {"ESTAB": "Established", "SYN-SENT": "SynSent", "SYN-RECV": "SynReceived", "FIN-WAIT-1": "FinWait1",
              "FIN-WAIT-2": "FinWait2", "TIME-WAIT": "TimeWait", "CLOSE-WAIT": "CloseWait", "LAST-ACK": "LastAck",
              "CLOSING": "Closing", "CLOSE": "Closed", "LISTEN": "Listen", "UNCONN": "-"}
@@ -234,6 +310,10 @@ class MacBackend(Backend):
     optional = ("route", "tcpdump")
 
     def install_hint(self, missing):
+        if "tcpdump" in missing and find_brew():
+            return "brew install tcpdump"
+        if "tcpdump" in missing:
+            return "install Homebrew (https://brew.sh), then: brew install tcpdump"
         return "These ship with macOS; check PATH (nettop/netstat live in /usr/bin)."
 
     def read_interfaces(self):
@@ -259,11 +339,10 @@ class LinuxBackend(Backend):
         self.family = osinfo["family"]
 
     def install_hint(self, missing):
-        if self.family == "debian":
-            return "sudo apt install " + " ".join(sorted({"iproute2" if m in ("ss", "ip") else m for m in missing}))
-        if self.family == "rhel":
-            return "sudo dnf install " + " ".join(sorted({"iproute" if m in ("ss", "ip") else m for m in missing})) + "   (yum on EL7)"
-        return "install iproute2/iproute and tcpdump with your package manager"
+        mgr = detect_pkg_manager()
+        pkgs = sorted({PKG_MAP.get(t, {}).get(mgr, t) for t in missing})
+        cmd = install_command(mgr, pkgs) if mgr else None
+        return " ".join(cmd) if cmd else "install iproute2/iproute and tcpdump with your package manager"
 
     def read_interfaces(self):
         try:
@@ -314,11 +393,18 @@ def get_backend():
     return _BACKEND
 
 
-def preflight(be, fatal=True):
-    """Check required/optional tools; returns list of missing optional tools. Exits if a required one is missing."""
+def preflight(be, fatal=True, assume_yes=False):
+    """Check required/optional tools, offering to install what is missing.
+    Returns the missing optional tools. Exits if a required one is still missing."""
     miss_req = [t for t in be.required if not shutil.which(t)]
     if miss_req and fatal:
-        raise SystemExit(f"netmon on {be.os['name']}: missing required tool(s): {', '.join(miss_req)}\n  -> {be.install_hint(miss_req)}")
+        miss_req = offer_install(miss_req, assume_yes, True)
+        if miss_req:
+            raise SystemExit(f"netmon on {be.os['name']}: missing required tool(s): {', '.join(miss_req)}\n  -> {be.install_hint(miss_req)}")
+    miss_opt = [t for t in be.optional if not shutil.which(t)]
+    installable = [t for t in miss_opt if t in PKG_MAP]
+    if installable and (assume_yes or (sys.stdin.isatty() and sys.stdout.isatty())):
+        offer_install(installable, assume_yes, False)       # tcpdump: packet capture is optional
     return [t for t in be.optional if not shutil.which(t)]
 
 
@@ -1034,9 +1120,16 @@ def once(flt=""):
 
 if __name__ == "__main__":
     be = get_backend()                       # detects the OS and exits cleanly if unsupported
+    assume = "-y" in sys.argv or "--yes" in sys.argv
     if "--selftest" in sys.argv:
         sys.exit(selftest())
-    preflight(be)                            # exits with an install hint if a required tool is missing
+    if "--install" in sys.argv:              # install every missing tool (asks first unless -y)
+        todo = [t for t in be.required + be.optional if not shutil.which(t) and t in PKG_MAP]
+        if not todo:
+            print("netmon: nothing to install.")
+            sys.exit(0)
+        sys.exit(1 if offer_install(todo, assume, True) else 0)
+    preflight(be, assume_yes=assume)         # offers to install missing tools, exits if a required one is still missing
     if "--once" in sys.argv:
         a = sys.argv
         once(a[a.index("--filter") + 1] if "--filter" in a and a.index("--filter") + 1 < len(a) else "")
